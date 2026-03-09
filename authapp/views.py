@@ -59,6 +59,12 @@ def register_view(request):
         first_name=first_name,
         last_name=last_name
     )
+
+    # Create default individual workspace and branding for new user
+    workspace_name = f"{first_name} {last_name}".strip() or email_lower.split("@")[0]
+    workspace = Workspace.objects.create(name=workspace_name, owner=user)
+    create_branding_for_workspace(workspace, user)
+
     tokens = get_tokens_for_user(user)
 
     return Response({
@@ -250,6 +256,9 @@ def workspace_to_dict(ws):
         'id': ws.id,
         'name': ws.name,
         'slug': ws.slug,
+        'type': ws.type or 'individual',
+        'phone': ws.phone or '',
+        'address': ws.address or '',
         'owner': ws.owner_id
     }
 
@@ -271,11 +280,18 @@ def workspace_list_create(request):
         )
 
     slug = data.get('slug')
+    ws_type = data.get('type', 'individual')
+    if ws_type not in ('individual', 'company'):
+        ws_type = 'individual'
     ws = Workspace.objects.create(
         name=name,
         slug=slug or '',
+        type=ws_type,
+        phone=data.get('phone', '') or '',
+        address=data.get('address', '') or '',
         owner=request.user
     )
+    create_branding_for_workspace(ws, request.user)
     return Response(workspace_to_dict(ws), status=status.HTTP_201_CREATED)
 
 
@@ -290,6 +306,11 @@ def workspace_detail(request, workspace_id):
         return Response(workspace_to_dict(workspace))
 
     if request.method == 'DELETE':
+        if Workspace.objects.filter(owner=request.user).count() <= 1:
+            return Response(
+                {'error': 'Cannot delete your only workspace'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         workspace.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -299,20 +320,125 @@ def workspace_detail(request, workspace_id):
         workspace.name = data['name']
     if 'slug' in data:
         workspace.slug = data['slug']
+    if 'type' in data and data['type'] in ('individual', 'company'):
+        workspace.type = data['type']
+    if 'phone' in data:
+        workspace.phone = data['phone'] or ''
+    if 'address' in data:
+        workspace.address = data['address'] or ''
     workspace.save()
     return Response(workspace_to_dict(workspace))
 
 
-# --- Branding views ---
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def workspace_by_slug(request, slug):
+    """Get workspace by slug for the current user."""
+    workspace = get_object_or_404(
+        Workspace, slug=slug, owner=request.user
+    )
+    return Response(workspace_to_dict(workspace))
+
+
+# --- Branding views (by slug) ---
+
+@api_view(['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def branding_by_slug(request, slug):
+    """Branding CRUD by workspace slug."""
+    workspace = get_object_or_404(
+        Workspace, slug=slug, owner=request.user
+    )
+
+    if request.method == 'GET':
+        try:
+            branding = workspace.branding
+            return Response(branding_to_dict(branding))
+        except Branding.DoesNotExist:
+            return Response(
+                {'error': 'branding not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+    if request.method == 'POST':
+        if hasattr(workspace, 'branding'):
+            return Response(
+                {'error': 'branding already exists for this workspace'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        branding = create_branding_for_workspace(workspace, request.user)
+        return Response(branding_to_dict(branding), status=status.HTTP_201_CREATED)
+
+    if request.method == 'DELETE':
+        try:
+            branding = workspace.branding
+            branding.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except Branding.DoesNotExist:
+            return Response(
+                {'error': 'branding not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+    # PUT / PATCH
+    try:
+        branding = workspace.branding
+    except Branding.DoesNotExist:
+        return Response(
+            {'error': 'branding not found'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    data = request.data
+    for field in ('logo', 'primaryColor', 'secondaryColor', 'tertiaryColor',
+                  'name', 'companyName', 'email', 'professionalTitle',
+                  'address', 'phone'):
+        if field in data:
+            setattr(branding, field, data[field] or '')
+    branding.save()
+    return Response(branding_to_dict(branding))
+
+
+# --- Branding views (by id, legacy) ---
+
+APP_PRIMARY_COLOR = '#975EED'
+APP_SECONDARY_COLOR = '#86EFAC'
+APP_TERTIARY_COLOR = '#93C5FD'
+
 
 def branding_to_dict(b):
     return {
         'id': b.id,
         'workspace': b.workspace_id,
-        'logo': b.logo,
-        'primaryColor': b.primaryColor,
-        'secondaryColor': b.secondaryColor
+        'workspaceSlug': b.workspace.slug,
+        'logo': b.logo or '',
+        'primaryColor': b.primaryColor or APP_PRIMARY_COLOR,
+        'secondaryColor': b.secondaryColor or APP_SECONDARY_COLOR,
+        'tertiaryColor': b.tertiaryColor or APP_TERTIARY_COLOR,
+        'name': b.name or '',
+        'companyName': b.companyName or '',
+        'email': b.email or '',
+        'professionalTitle': b.professionalTitle or '',
+        'address': b.address or '',
+        'phone': b.phone or '',
     }
+
+
+def create_branding_for_workspace(workspace, user):
+    """Create branding with defaults: app primary color, user name, workspace name."""
+    name = f"{user.first_name} {user.last_name}".strip() or user.email or ''
+    return Branding.objects.create(
+        workspace=workspace,
+        primaryColor=APP_PRIMARY_COLOR,
+        secondaryColor=APP_SECONDARY_COLOR,
+        tertiaryColor=APP_TERTIARY_COLOR,
+        name=name,
+        companyName=workspace.name,
+        email=user.email or '',
+        professionalTitle='',
+        address='',
+        phone='',
+    )
 
 
 @api_view(['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
@@ -338,13 +464,7 @@ def branding_detail(request, workspace_id):
                 {'error': 'branding already exists for this workspace'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        data = request.data
-        branding = Branding.objects.create(
-            workspace=workspace,
-            logo=data.get('logo', ''),
-            primaryColor=data.get('primaryColor', ''),
-            secondaryColor=data.get('secondaryColor', '')
-        )
+        branding = create_branding_for_workspace(workspace, request.user)
         return Response(branding_to_dict(branding), status=status.HTTP_201_CREATED)
 
     if request.method == 'DELETE':
@@ -368,11 +488,10 @@ def branding_detail(request, workspace_id):
         )
 
     data = request.data
-    if 'logo' in data:
-        branding.logo = data['logo']
-    if 'primaryColor' in data:
-        branding.primaryColor = data['primaryColor']
-    if 'secondaryColor' in data:
-        branding.secondaryColor = data['secondaryColor']
+    for field in ('logo', 'primaryColor', 'secondaryColor', 'tertiaryColor',
+                  'name', 'companyName', 'email', 'professionalTitle',
+                  'address', 'phone'):
+        if field in data:
+            setattr(branding, field, data[field] or '')
     branding.save()
     return Response(branding_to_dict(branding))

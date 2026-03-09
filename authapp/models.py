@@ -16,8 +16,18 @@ class PasswordResetOTP(models.Model):
 
 
 class Workspace(models.Model):
+    TYPE_INDIVIDUAL = 'individual'
+    TYPE_COMPANY = 'company'
+    TYPE_CHOICES = [
+        (TYPE_INDIVIDUAL, 'Individual'),
+        (TYPE_COMPANY, 'Company'),
+    ]
+
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=255, unique=True)
+    type = models.CharField(max_length=20, choices=TYPE_CHOICES, default=TYPE_INDIVIDUAL)
+    phone = models.CharField(max_length=50, blank=True, default='')
+    address = models.CharField(max_length=500, blank=True, default='')
     owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='workspaces')
 
     class Meta:
@@ -43,8 +53,15 @@ class Branding(models.Model):
         Workspace, on_delete=models.CASCADE, related_name='branding'
     )
     logo = models.URLField(blank=True, default='')
-    primaryColor = models.CharField(max_length=50, blank=True, default='')
-    secondaryColor = models.CharField(max_length=50, blank=True, default='')
+    primaryColor = models.CharField(max_length=50, blank=True, default='#975EED')
+    secondaryColor = models.CharField(max_length=50, blank=True, default='#86EFAC')
+    tertiaryColor = models.CharField(max_length=50, blank=True, default='#93C5FD')
+    name = models.CharField(max_length=255, blank=True, default='')
+    companyName = models.CharField(max_length=255, blank=True, default='')
+    email = models.EmailField(blank=True, default='')
+    professionalTitle = models.CharField(max_length=255, blank=True, default='')
+    address = models.CharField(max_length=500, blank=True, default='')
+    phone = models.CharField(max_length=50, blank=True, default='')
 
     def __str__(self):
         return f'Branding for {self.workspace.name}'

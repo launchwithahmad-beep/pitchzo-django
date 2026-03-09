@@ -12,6 +12,8 @@ urlpatterns = [
     path('auth/password-reset/verify-otp/', views.password_reset_verify_otp_view, name='password_reset_verify_otp'),
     path('auth/password-reset/confirm/', views.password_reset_confirm_view, name='password_reset_confirm'),
     path('workspaces/', views.workspace_list_create, name='workspace_list_create'),
+    path('workspaces/by-slug/<slug:slug>/', views.workspace_by_slug, name='workspace_by_slug'),
+    path('workspaces/by-slug/<slug:slug>/branding/', views.branding_by_slug, name='branding_by_slug'),
     path('workspaces/<int:workspace_id>/', views.workspace_detail, name='workspace_detail'),
     path('workspaces/<int:workspace_id>/branding/', views.branding_detail, name='branding_detail'),
 ]
