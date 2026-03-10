@@ -2,7 +2,6 @@ import random
 import string
 import uuid
 from django.contrib.auth import authenticate
-from django.contrib.auth.models import User
 from django.core.mail import send_mail
 from django.conf import settings
 from django.shortcuts import get_object_or_404
@@ -12,7 +11,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import Workspace, Branding, PasswordResetOTP
+from .models import Workspace, Branding, PasswordResetOTP, UserPreferences, UserNotifications, User
 
 
 def get_tokens_for_user(user):
@@ -65,6 +64,10 @@ def register_view(request):
     workspace = Workspace.objects.create(name=workspace_name, owner=user)
     create_branding_for_workspace(workspace, user)
 
+    # Create preferences and notifications for new user
+    UserPreferences.objects.create(user=user, default_workspace=workspace)
+    UserNotifications.objects.create(user=user)
+
     tokens = get_tokens_for_user(user)
 
     return Response({
@@ -102,15 +105,170 @@ def login_view(request):
     return Response(tokens)
 
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def profile_view(request):
-    user = request.user
-    return Response({
+def _profile_to_response(user, request=None):
+    avatar_url = ''
+    if user.avatar:
+        avatar_url = user.avatar.url
+        if request:
+            avatar_url = request.build_absolute_uri(avatar_url)
+    return {
         'id': user.id,
         'email': user.email or '',
         'first_name': user.first_name or '',
         'last_name': user.last_name or '',
+        'avatar': avatar_url or None,
+        'phone': user.phone or '',
+        'address': user.address or '',
+    }
+
+
+@api_view(['GET', 'PATCH'])
+@permission_classes([IsAuthenticated])
+def profile_view(request):
+    user = request.user
+    if request.method == 'GET':
+        return Response(_profile_to_response(user, request))
+
+    # PATCH - update profile (avatar, phone, address are on User model)
+    data = request.data
+    avatar_file = request.FILES.get('avatar')
+    avatar_removed = data.get('avatarRemoved') == 'true' or data.get('avatarRemoved') is True
+
+    if 'first_name' in data:
+        user.first_name = (data['first_name'] or '').strip()
+    if 'last_name' in data:
+        user.last_name = (data['last_name'] or '').strip()
+    if 'phone' in data:
+        user.phone = data['phone'] or ''
+    if 'address' in data:
+        user.address = data['address'] or ''
+    if avatar_file:
+        if user.avatar:
+            user.avatar.delete(save=False)
+        user.avatar = avatar_file
+    elif avatar_removed and user.avatar:
+        user.avatar.delete(save=False)
+        user.avatar = None
+    user.save()
+
+    return Response(_profile_to_response(user, request))
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def change_password_view(request):
+    """Change password for authenticated user."""
+    data = request.data
+    old_password = data.get('old_password')
+    new_password = data.get('new_password')
+    confirm_password = data.get('confirm_password')
+
+    if not old_password or not new_password or not confirm_password:
+        return Response(
+            {'error': 'old_password, new_password and confirm_password are required'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    if new_password != confirm_password:
+        return Response(
+            {'error': 'new password and confirm password do not match'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    user = request.user
+    if not user.check_password(old_password):
+        return Response(
+            {'error': 'current password is incorrect'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    from django.contrib.auth.password_validation import validate_password
+    from django.core.exceptions import ValidationError
+    try:
+        validate_password(new_password, user)
+    except ValidationError as e:
+        msg = list(e.messages)[0] if e.messages else 'Password does not meet requirements'
+        return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    user.set_password(new_password)
+    user.save()
+
+    return Response({'success': True, 'message': 'Password has been changed'})
+
+
+# --- Preferences and Notifications ---
+
+def _get_or_create_preferences(user):
+    prefs, _ = UserPreferences.objects.get_or_create(user=user)
+    return prefs
+
+
+def _get_or_create_notifications(user):
+    notifs, _ = UserNotifications.objects.get_or_create(user=user)
+    return notifs
+
+
+@api_view(['GET', 'PATCH'])
+@permission_classes([IsAuthenticated])
+def preferences_view(request):
+    prefs = _get_or_create_preferences(request.user)
+    if request.method == 'GET':
+        return Response({
+            'language': prefs.language,
+            'timezone': prefs.timezone,
+            'time_format': prefs.time_format,
+            'first_day_of_week': prefs.first_day_of_week,
+            'auto_sync': prefs.auto_sync,
+            'default_workspace': prefs.default_workspace_id,
+            'default_workspace_slug': prefs.default_workspace.slug if prefs.default_workspace else None,
+            'default_workspace_name': prefs.default_workspace.name if prefs.default_workspace else None,
+        })
+    data = request.data
+    for field in ('language', 'timezone', 'time_format', 'first_day_of_week', 'auto_sync'):
+        if field in data:
+            setattr(prefs, field, data[field] or '')
+    if 'default_workspace' in data:
+        ws_id = data['default_workspace']
+        if ws_id is None or ws_id == '':
+            prefs.default_workspace = None
+        else:
+            ws = Workspace.objects.filter(id=ws_id, owner=request.user).first()
+            prefs.default_workspace = ws
+    prefs.save()
+    return Response({
+        'language': prefs.language,
+        'timezone': prefs.timezone,
+        'time_format': prefs.time_format,
+        'first_day_of_week': prefs.first_day_of_week,
+        'auto_sync': prefs.auto_sync,
+        'default_workspace': prefs.default_workspace_id,
+        'default_workspace_slug': prefs.default_workspace.slug if prefs.default_workspace else None,
+        'default_workspace_name': prefs.default_workspace.name if prefs.default_workspace else None,
+    })
+
+
+@api_view(['GET', 'PATCH'])
+@permission_classes([IsAuthenticated])
+def notifications_view(request):
+    notifs = _get_or_create_notifications(request.user)
+    if request.method == 'GET':
+        return Response({
+            'new_project': notifs.new_project,
+            'email': notifs.email,
+            'projects_sync': notifs.projects_sync,
+            'update': notifs.update,
+            'in_app': notifs.in_app,
+        })
+    data = request.data
+    for field in ('new_project', 'email', 'projects_sync', 'update', 'in_app'):
+        if field in data:
+            setattr(notifs, field, bool(data[field]))
+    notifs.save()
+    return Response({
+        'new_project': notifs.new_project,
+        'email': notifs.email,
+        'projects_sync': notifs.projects_sync,
+        'update': notifs.update,
+        'in_app': notifs.in_app,
     })
 
 
@@ -353,7 +511,7 @@ def branding_by_slug(request, slug):
     if request.method == 'GET':
         try:
             branding = workspace.branding
-            return Response(branding_to_dict(branding))
+            return Response(branding_to_dict(branding, request))
         except Branding.DoesNotExist:
             return Response(
                 {'error': 'branding not found'},
@@ -367,7 +525,17 @@ def branding_by_slug(request, slug):
                 status=status.HTTP_400_BAD_REQUEST
             )
         branding = create_branding_for_workspace(workspace, request.user)
-        return Response(branding_to_dict(branding), status=status.HTTP_201_CREATED)
+        data = request.data
+        logo_file = request.FILES.get('logo')
+        for field in ('primaryColor', 'secondaryColor', 'tertiaryColor',
+                      'name', 'companyName', 'email', 'professionalTitle',
+                      'address', 'phone'):
+            if field in data:
+                setattr(branding, field, data[field] or '')
+        if logo_file:
+            branding.logo = logo_file
+        branding.save()
+        return Response(branding_to_dict(branding, request), status=status.HTTP_201_CREATED)
 
     if request.method == 'DELETE':
         try:
@@ -390,13 +558,25 @@ def branding_by_slug(request, slug):
         )
 
     data = request.data
-    for field in ('logo', 'primaryColor', 'secondaryColor', 'tertiaryColor',
+    logo_file = request.FILES.get('logo')
+    logo_removed = data.get('logoRemoved') == 'true' or data.get('logoRemoved') is True
+
+    for field in ('primaryColor', 'secondaryColor', 'tertiaryColor',
                   'name', 'companyName', 'email', 'professionalTitle',
                   'address', 'phone'):
         if field in data:
             setattr(branding, field, data[field] or '')
+
+    if logo_file:
+        if branding.logo:
+            branding.logo.delete(save=False)
+        branding.logo = logo_file
+    elif logo_removed and branding.logo:
+        branding.logo.delete(save=False)
+        branding.logo = None
+
     branding.save()
-    return Response(branding_to_dict(branding))
+    return Response(branding_to_dict(branding, request))
 
 
 # --- Branding views (by id, legacy) ---
@@ -406,12 +586,17 @@ APP_SECONDARY_COLOR = '#86EFAC'
 APP_TERTIARY_COLOR = '#93C5FD'
 
 
-def branding_to_dict(b):
+def branding_to_dict(b, request=None):
+    logo_url = ''
+    if b.logo:
+        logo_url = b.logo.url
+        if request:
+            logo_url = request.build_absolute_uri(logo_url)
     return {
         'id': b.id,
         'workspace': b.workspace_id,
         'workspaceSlug': b.workspace.slug,
-        'logo': b.logo or '',
+        'logo': logo_url,
         'primaryColor': b.primaryColor or APP_PRIMARY_COLOR,
         'secondaryColor': b.secondaryColor or APP_SECONDARY_COLOR,
         'tertiaryColor': b.tertiaryColor or APP_TERTIARY_COLOR,
@@ -451,7 +636,7 @@ def branding_detail(request, workspace_id):
     if request.method == 'GET':
         try:
             branding = workspace.branding
-            return Response(branding_to_dict(branding))
+            return Response(branding_to_dict(branding, request))
         except Branding.DoesNotExist:
             return Response(
                 {'error': 'branding not found'},
@@ -465,7 +650,17 @@ def branding_detail(request, workspace_id):
                 status=status.HTTP_400_BAD_REQUEST
             )
         branding = create_branding_for_workspace(workspace, request.user)
-        return Response(branding_to_dict(branding), status=status.HTTP_201_CREATED)
+        data = request.data
+        logo_file = request.FILES.get('logo')
+        for field in ('primaryColor', 'secondaryColor', 'tertiaryColor',
+                      'name', 'companyName', 'email', 'professionalTitle',
+                      'address', 'phone'):
+            if field in data:
+                setattr(branding, field, data[field] or '')
+        if logo_file:
+            branding.logo = logo_file
+        branding.save()
+        return Response(branding_to_dict(branding, request), status=status.HTTP_201_CREATED)
 
     if request.method == 'DELETE':
         try:
@@ -488,10 +683,19 @@ def branding_detail(request, workspace_id):
         )
 
     data = request.data
-    for field in ('logo', 'primaryColor', 'secondaryColor', 'tertiaryColor',
+    logo_file = request.FILES.get('logo')
+    logo_removed = data.get('logoRemoved') == 'true' or data.get('logoRemoved') is True
+    for field in ('primaryColor', 'secondaryColor', 'tertiaryColor',
                   'name', 'companyName', 'email', 'professionalTitle',
                   'address', 'phone'):
         if field in data:
             setattr(branding, field, data[field] or '')
+    if logo_file:
+        if branding.logo:
+            branding.logo.delete(save=False)
+        branding.logo = logo_file
+    elif logo_removed and branding.logo:
+        branding.logo.delete(save=False)
+        branding.logo = None
     branding.save()
-    return Response(branding_to_dict(branding))
+    return Response(branding_to_dict(branding, request))

@@ -128,6 +128,11 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
+# Media files (user uploads)
+import os
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
 # Django REST Framework
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
@@ -147,3 +152,6 @@ SIMPLE_JWT = {
 # Email (console backend for dev - prints to terminal)
 EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 DEFAULT_FROM_EMAIL = 'noreply@pitchzo.com'
+
+# Custom User model (avatar, phone, address as part of default auth)
+AUTH_USER_MODEL = 'authapp.User'
