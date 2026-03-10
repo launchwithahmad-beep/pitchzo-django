@@ -33,6 +33,8 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
+# Required when frontend uses credentials: 'include'
+CORS_ALLOW_CREDENTIALS = True
 
 
 # Application definition
@@ -48,6 +50,7 @@ INSTALLED_APPS = [
     'rest_framework',
     "mainapp",
     "authapp",
+    "clientsapp",
 ]
 
 MIDDLEWARE = [

@@ -425,8 +425,15 @@ def workspace_to_dict(ws):
 @permission_classes([IsAuthenticated])
 def workspace_list_create(request):
     if request.method == 'GET':
-        workspaces = Workspace.objects.filter(owner=request.user)
-        return Response([workspace_to_dict(ws) for ws in workspaces])
+        fewfields = request.query_params.get('fewfields', '').lower() == 'true'
+        if fewfields:
+            data = list(
+                Workspace.objects.filter(owner=request.user).values('name', 'slug')
+            )
+        else:
+            workspaces = Workspace.objects.filter(owner=request.user)
+            data = [workspace_to_dict(ws) for ws in workspaces]
+        return Response(data)
 
     # POST
     data = request.data
