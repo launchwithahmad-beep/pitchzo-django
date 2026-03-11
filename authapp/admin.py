@@ -11,7 +11,14 @@ class UserAdmin(BaseUserAdmin):
 
 
 admin.site.register(User, UserAdmin)
-admin.site.register(Workspace)
+
+
+@admin.register(Workspace)
+class WorkspaceAdmin(admin.ModelAdmin):
+    list_display = ('name', 'slug', 'type', 'owner', 'default_template')
+    raw_id_fields = ('owner', 'default_template')
+
+
 admin.site.register(Branding)
 admin.site.register(UserPreferences)
 admin.site.register(UserNotifications)

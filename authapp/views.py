@@ -2,9 +2,11 @@ import random
 import string
 import uuid
 from django.contrib.auth import authenticate
+from django.core.exceptions import ValidationError
 from django.core.mail import send_mail
 from django.conf import settings
 from django.shortcuts import get_object_or_404
+from pitchzo.validators import validate_image_file, validation_error_message
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -143,6 +145,10 @@ def profile_view(request):
     if 'address' in data:
         user.address = data['address'] or ''
     if avatar_file:
+        try:
+            validate_image_file(avatar_file)
+        except ValidationError as e:
+            return Response({'error': validation_error_message(e)}, status=status.HTTP_400_BAD_REQUEST)
         if user.avatar:
             user.avatar.delete(save=False)
         user.avatar = avatar_file
@@ -417,7 +423,8 @@ def workspace_to_dict(ws):
         'type': ws.type or 'individual',
         'phone': ws.phone or '',
         'address': ws.address or '',
-        'owner': ws.owner_id
+        'owner': ws.owner_id,
+        'default_template_id': ws.default_template_id,
     }
 
 
@@ -448,13 +455,23 @@ def workspace_list_create(request):
     ws_type = data.get('type', 'individual')
     if ws_type not in ('individual', 'company'):
         ws_type = 'individual'
+    default_template_id = data.get('default_template_id')
+    default_template = None
+    if default_template_id:
+        from proposalsapp.models import Template
+        try:
+            default_template = Template.objects.get(id=default_template_id)
+        except (Template.DoesNotExist, ValueError):
+            pass
+
     ws = Workspace.objects.create(
         name=name,
         slug=slug or '',
         type=ws_type,
         phone=data.get('phone', '') or '',
         address=data.get('address', '') or '',
-        owner=request.user
+        owner=request.user,
+        default_template=default_template,
     )
     create_branding_for_workspace(ws, request.user)
     return Response(workspace_to_dict(ws), status=status.HTTP_201_CREATED)
@@ -491,17 +508,44 @@ def workspace_detail(request, workspace_id):
         workspace.phone = data['phone'] or ''
     if 'address' in data:
         workspace.address = data['address'] or ''
+    if 'default_template_id' in data:
+        from proposalsapp.models import Template
+        tid = data['default_template_id']
+        if tid is None or tid == '':
+            workspace.default_template = None
+        else:
+            try:
+                workspace.default_template = Template.objects.get(id=tid)
+            except (Template.DoesNotExist, ValueError):
+                workspace.default_template = None
     workspace.save()
     return Response(workspace_to_dict(workspace))
 
 
-@api_view(['GET'])
+@api_view(['GET', 'PATCH'])
 @permission_classes([IsAuthenticated])
 def workspace_by_slug(request, slug):
-    """Get workspace by slug for the current user."""
+    """Get or update workspace by slug for the current user."""
     workspace = get_object_or_404(
         Workspace, slug=slug, owner=request.user
     )
+
+    if request.method == 'GET':
+        return Response(workspace_to_dict(workspace))
+
+    # PATCH - allow updating default_template_id
+    data = request.data
+    if 'default_template_id' in data:
+        from proposalsapp.models import Template
+        tid = data['default_template_id']
+        if tid is None or tid == '':
+            workspace.default_template = None
+        else:
+            try:
+                workspace.default_template = Template.objects.get(id=tid)
+            except (Template.DoesNotExist, ValueError):
+                workspace.default_template = None
+        workspace.save()
     return Response(workspace_to_dict(workspace))
 
 
@@ -540,6 +584,10 @@ def branding_by_slug(request, slug):
             if field in data:
                 setattr(branding, field, data[field] or '')
         if logo_file:
+            try:
+                validate_image_file(logo_file)
+            except ValidationError as e:
+                return Response({'error': validation_error_message(e)}, status=status.HTTP_400_BAD_REQUEST)
             branding.logo = logo_file
         branding.save()
         return Response(branding_to_dict(branding, request), status=status.HTTP_201_CREATED)
@@ -575,6 +623,10 @@ def branding_by_slug(request, slug):
             setattr(branding, field, data[field] or '')
 
     if logo_file:
+        try:
+            validate_image_file(logo_file)
+        except ValidationError as e:
+            return Response({'error': validation_error_message(e)}, status=status.HTTP_400_BAD_REQUEST)
         if branding.logo:
             branding.logo.delete(save=False)
         branding.logo = logo_file
@@ -665,6 +717,10 @@ def branding_detail(request, workspace_id):
             if field in data:
                 setattr(branding, field, data[field] or '')
         if logo_file:
+            try:
+                validate_image_file(logo_file)
+            except ValidationError as e:
+                return Response({'error': validation_error_message(e)}, status=status.HTTP_400_BAD_REQUEST)
             branding.logo = logo_file
         branding.save()
         return Response(branding_to_dict(branding, request), status=status.HTTP_201_CREATED)
@@ -698,6 +754,10 @@ def branding_detail(request, workspace_id):
         if field in data:
             setattr(branding, field, data[field] or '')
     if logo_file:
+        try:
+            validate_image_file(logo_file)
+        except ValidationError as e:
+            return Response({'error': validation_error_message(e)}, status=status.HTTP_400_BAD_REQUEST)
         if branding.logo:
             branding.logo.delete(save=False)
         branding.logo = logo_file

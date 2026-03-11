@@ -4,6 +4,8 @@ from django.contrib.auth.models import AbstractUser
 from django.utils import timezone
 from django.utils.text import slugify
 
+from pitchzo.validators import validate_image_file
+
 
 def user_avatar_upload_to(instance, filename):
     ext = filename.split('.')[-1] if '.' in filename else 'png'
@@ -12,7 +14,12 @@ def user_avatar_upload_to(instance, filename):
 
 class User(AbstractUser):
     """Custom User model with avatar, phone, address as part of default auth."""
-    avatar = models.ImageField(upload_to=user_avatar_upload_to, blank=True, null=True)
+    avatar = models.ImageField(
+        upload_to=user_avatar_upload_to,
+        blank=True,
+        null=True,
+        validators=[validate_image_file],
+    )
     phone = models.CharField(max_length=50, blank=True, default='')
     address = models.CharField(max_length=500, blank=True, default='')
 
@@ -44,6 +51,13 @@ class Workspace(models.Model):
     phone = models.CharField(max_length=50, blank=True, default='')
     address = models.CharField(max_length=500, blank=True, default='')
     owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='workspaces')
+    default_template = models.ForeignKey(
+        'proposalsapp.Template',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='workspaces',
+    )
 
     class Meta:
         ordering = ['name']
@@ -72,7 +86,12 @@ class Branding(models.Model):
     workspace = models.OneToOneField(
         Workspace, on_delete=models.CASCADE, related_name='branding'
     )
-    logo = models.ImageField(upload_to=branding_logo_upload_to, blank=True, null=True)
+    logo = models.ImageField(
+        upload_to=branding_logo_upload_to,
+        blank=True,
+        null=True,
+        validators=[validate_image_file],
+    )
     primaryColor = models.CharField(max_length=50, blank=True, default='#975EED')
     secondaryColor = models.CharField(max_length=50, blank=True, default='#86EFAC')
     tertiaryColor = models.CharField(max_length=50, blank=True, default='#93C5FD')
