@@ -57,6 +57,39 @@ class ProposalGenBy(models.TextChoices):
     AI = 'ai', 'AI'
 
 
+class ProposalSectionType(models.TextChoices):
+    """Strict allowlist of section types. No custom types allowed."""
+    # Front Matter
+    COVER_PAGE = 'cover_page', 'Cover Page'
+    COVER_LETTER = 'cover_letter', 'Cover Letter'
+    EXECUTIVE_SUMMARY = 'executive_summary', 'Executive Summary'
+    # Strategy & Alignment
+    PROBLEM_STATEMENT = 'problem_statement', 'Problem Statement'
+    DISCOVERY_AUDIT_FINDINGS = 'discovery_audit_findings', 'Discovery/Audit Findings'
+    PROJECT_GOALS_KPIS = 'project_goals_kpis', 'Project Goals & KPIs'
+    # Execution & Scope
+    PROPOSED_SOLUTION = 'proposed_solution', 'Proposed Solution'
+    SCOPE_OF_WORK = 'scope_of_work', 'Scope of Work'
+    OUT_OF_SCOPE = 'out_of_scope', 'Out of Scope'
+    TECH_STACK_ARCHITECTURE = 'tech_stack_architecture', 'Tech Stack & Architecture'
+    TIMELINE_SPRINTS = 'timeline_sprints', 'Timeline & Sprints'
+    # Proof & Credibility
+    RELEVANT_PORTFOLIO_CASE_STUDIES = 'relevant_portfolio_case_studies', 'Relevant Portfolio & Case Studies'
+    TESTIMONIALS_REVIEWS = 'testimonials_reviews', 'Testimonials & Reviews'
+    MEET_THE_TEAM = 'meet_the_team', 'Meet the Team'
+    COMPANY_AGENCY_OVERVIEW = 'company_agency_overview', 'Company/Agency Overview'
+    # Financials
+    PRICING_ESTIMATE_TIERS = 'pricing_estimate_tiers', 'Pricing & Estimate Tiers'
+    PAYMENT_SCHEDULE = 'payment_schedule', 'Payment Schedule'
+    EXPECTED_ROI_BUSINESS_CASE = 'expected_roi_business_case', 'Expected ROI & Business Case'
+    ONGOING_MAINTENANCE_SUPPORT = 'ongoing_maintenance_support', 'Ongoing Maintenance & Support'
+    # Closing & Legal
+    NEXT_STEPS_CTA = 'next_steps_cta', 'Next Steps & CTA'
+    FAQS = 'faqs', 'FAQs'
+    TERMS_CONDITIONS_MSA = 'terms_conditions_msa', 'Terms, Conditions & MSA'
+    ACCEPTANCE_ESIGNATURE = 'acceptance_esignature', 'Acceptance & E-Signature'
+
+
 class ProposalCategory(models.TextChoices):
     DEVELOPMENT = 'development', 'Development'
     DESIGN = 'design', 'Design'
@@ -204,6 +237,13 @@ class Proposal(models.Model):
         on_delete=models.CASCADE,
         related_name='proposals',
     )
+    template = models.ForeignKey(
+        Template,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='proposals',
+    )
     currency = models.CharField(max_length=10)
     subtotal = models.DecimalField(max_digits=14, decimal_places=2)
     tax = models.DecimalField(max_digits=14, decimal_places=2)
@@ -224,3 +264,27 @@ class Proposal(models.Model):
 
     def __str__(self):
         return self.title
+
+
+class ProposalSection(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    proposal = models.ForeignKey(
+        Proposal,
+        on_delete=models.CASCADE,
+        related_name='sections',
+    )
+    section_type = models.CharField(
+        max_length=80,
+        choices=ProposalSectionType.choices,
+    )
+    title = models.CharField(max_length=255)
+    content = models.JSONField(default=dict, blank=True)
+    order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['order', 'created_at']
+
+    def __str__(self):
+        return f"{self.proposal.title} - {self.title}"

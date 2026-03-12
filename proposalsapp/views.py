@@ -1,7 +1,10 @@
 import json
+import os
+import uuid
 from decimal import Decimal
 
-from django.db.models import Q
+from django.core.files.storage import default_storage
+from django.db.models import Max, Q
 from django.core.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
 from pitchzo.validators import validate_image_file, validation_error_message
@@ -13,7 +16,21 @@ from rest_framework.response import Response
 from authapp.models import User, Workspace
 from clientsapp.models import Client
 
-from .models import Portfolio, PortfolioImage, PortfolioSource, PortfolioType, Proposal, ProposalCategory, ProposalGenBy, ProposalSentVia, ProposalStatus, Template, TemplateCategory
+from .models import (
+    Portfolio,
+    PortfolioImage,
+    PortfolioSource,
+    PortfolioType,
+    Proposal,
+    ProposalCategory,
+    ProposalGenBy,
+    ProposalSection,
+    ProposalSectionType,
+    ProposalSentVia,
+    ProposalStatus,
+    Template,
+    TemplateCategory,
+)
 
 
 def portfolio_to_dict(portfolio, request=None):
@@ -67,7 +84,31 @@ def template_to_dict(template, request=None):
     }
 
 
+def section_to_dict(section, request=None):
+    return {
+        'id': str(section.id),
+        'section_type': section.section_type,
+        'title': section.title,
+        'content': section.content or {},
+        'order': section.order,
+        'created_at': section.created_at.isoformat(),
+        'updated_at': section.updated_at.isoformat(),
+    }
+
+
 def proposal_to_dict(proposal, request=None):
+    template = proposal.template
+    template_image = ''
+    if template and template.image:
+        template_image = template.image.url
+        if request:
+            template_image = request.build_absolute_uri(template_image)
+
+    sections = [
+        section_to_dict(s, request)
+        for s in proposal.sections.all().order_by('order', 'created_at')
+    ]
+
     data = {
         'id': str(proposal.id),
         'title': proposal.title,
@@ -82,7 +123,13 @@ def proposal_to_dict(proposal, request=None):
         'sender_id': str(proposal.sender_id) if proposal.sender_id else None,
         'workspace_id': proposal.workspace_id,
         'workspace_slug': proposal.workspace.slug,
+        'template_id': template.id if template else None,
+        'template_title': template.title if template else None,
+        'template_image': template_image,
+        'template_category': template.category if template else None,
         'project_ids': [str(p.id) for p in proposal.projects.all()],
+        'projects': [portfolio_to_dict(p, request) for p in proposal.projects.all()],
+        'sections': sections,
         'currency': proposal.currency,
         'subtotal': str(proposal.subtotal),
         'tax': str(proposal.tax),
@@ -360,9 +407,13 @@ def portfolio_detail(request, slug, portfolio_id):
     if 'tags' in data:
         tags = data['tags']
         if isinstance(tags, list):
-            portfolio.tags = tags
+            portfolio.tags = [str(t).strip() for t in tags if t]
         elif isinstance(tags, str):
-            portfolio.tags = [t.strip() for t in tags.split(',') if t.strip()]
+            try:
+                parsed = json.loads(tags)
+                portfolio.tags = [str(t).strip() for t in parsed if t] if isinstance(parsed, list) else [t.strip() for t in tags.split(',') if t.strip()]
+            except (json.JSONDecodeError, TypeError):
+                portfolio.tags = [t.strip() for t in tags.split(',') if t.strip()]
     if 'source' in data and data['source'] in [s[0] for s in PortfolioSource.choices]:
         portfolio.source = data['source']
     if 'resource' in data:
@@ -515,6 +566,16 @@ def proposal_list_create(request, slug):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+    template = None
+    template_id = data.get('template_id')
+    if template_id is not None and template_id != '':
+        template = Template.objects.filter(id=template_id).first()
+        if not template:
+            return Response(
+                {'error': 'template not found'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
     status_val = data.get('status', 'draft')
     if status_val not in [s[0] for s in ProposalStatus.choices]:
         status_val = 'draft'
@@ -532,6 +593,7 @@ def proposal_list_create(request, slug):
         company_name=data.get('company_name') or '',
         category=category,
         client=client,
+        template=template,
         sender=request.user,
         workspace=workspace,
         currency=currency,
@@ -632,5 +694,143 @@ def proposal_detail(request, slug, proposal_id):
         portfolios = Portfolio.objects.filter(id__in=project_ids, workspace=workspace)
         proposal.projects.set(portfolios)
 
+    if 'template_id' in data:
+        if data['template_id'] is None or data['template_id'] == '':
+            proposal.template = None
+        else:
+            template = Template.objects.filter(id=data['template_id']).first()
+            proposal.template = template
+
     proposal.save()
     return Response(proposal_to_dict(proposal, request))
+
+
+# --- Proposal Sections API ---
+
+VALID_SECTION_TYPES = [c[0] for c in ProposalSectionType.choices]
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def proposal_section_list_create(request, slug, proposal_id):
+    """List or create sections for a proposal."""
+    workspace = get_object_or_404(Workspace, slug=slug, owner=request.user)
+    proposal = get_object_or_404(Proposal, id=proposal_id, workspace=workspace)
+
+    if request.method == 'GET':
+        sections = proposal.sections.all().order_by('order', 'created_at')
+        return Response([section_to_dict(s, request) for s in sections])
+
+    # POST
+    data = request.data
+    section_type = data.get('section_type')
+    title = data.get('title', '')
+
+    if not section_type:
+        return Response(
+            {'error': 'section_type is required'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    if section_type not in VALID_SECTION_TYPES:
+        return Response(
+            {'error': f'section_type must be one of: {", ".join(VALID_SECTION_TYPES)}'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    max_order = proposal.sections.aggregate(
+        max_order=Max('order')
+    )['max_order'] or 0
+
+    section = ProposalSection.objects.create(
+        proposal=proposal,
+        section_type=section_type,
+        title=title or dict(ProposalSectionType.choices).get(section_type, section_type.replace('_', ' ').title()),
+        content=data.get('content') or {},
+        order=max_order + 1,
+    )
+    return Response(section_to_dict(section, request), status=status.HTTP_201_CREATED)
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def proposal_section_reorder(request, slug, proposal_id):
+    """Bulk update section order."""
+    workspace = get_object_or_404(Workspace, slug=slug, owner=request.user)
+    proposal = get_object_or_404(Proposal, id=proposal_id, workspace=workspace)
+
+    data = request.data
+    section_ids = data.get('section_ids')
+    if not section_ids or not isinstance(section_ids, list):
+        return Response(
+            {'error': 'section_ids array is required'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    for order, sid in enumerate(section_ids):
+        try:
+            section = proposal.sections.get(id=sid)
+            section.order = order
+            section.save()
+        except (ProposalSection.DoesNotExist, ValueError, TypeError):
+            pass
+
+    sections = proposal.sections.all().order_by('order', 'created_at')
+    return Response([section_to_dict(s, request) for s in sections])
+
+
+@api_view(['GET', 'PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def proposal_section_detail(request, slug, proposal_id, section_id):
+    """Get, update, or delete a section."""
+    workspace = get_object_or_404(Workspace, slug=slug, owner=request.user)
+    proposal = get_object_or_404(Proposal, id=proposal_id, workspace=workspace)
+    section = get_object_or_404(ProposalSection, id=section_id, proposal=proposal)
+
+    if request.method == 'GET':
+        return Response(section_to_dict(section, request))
+
+    if request.method == 'DELETE':
+        section.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # PATCH - title and content only; section_type fixed after creation
+    data = request.data
+    if 'title' in data:
+        section.title = data['title']
+    if 'content' in data:
+        section.content = data['content'] if isinstance(data['content'], dict) else {}
+    section.save()
+    return Response(section_to_dict(section, request))
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def proposal_section_media_upload(request, slug, proposal_id, section_id):
+    """Upload an image for a proposal section (signature, team photo, etc.)."""
+    workspace = get_object_or_404(Workspace, slug=slug, owner=request.user)
+    proposal = get_object_or_404(Proposal, id=proposal_id, workspace=workspace)
+    section = get_object_or_404(ProposalSection, id=section_id, proposal=proposal)
+
+    file_obj = request.FILES.get('file')
+    if not file_obj:
+        return Response(
+            {'error': 'No file provided. Use form field "file".'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    try:
+        validate_image_file(file_obj)
+    except ValidationError as e:
+        return Response(
+            {'error': validation_error_message(e)},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    ext = os.path.splitext(getattr(file_obj, 'name', '') or '')[1].lstrip('.').lower()
+    if ext not in {'jpg', 'jpeg', 'png', 'webp', 'avif'}:
+        ext = 'png'
+    filename = f'proposal_sections/{proposal_id}/{section_id}/{uuid.uuid4().hex[:12]}.{ext}'
+    saved_name = default_storage.save(filename, file_obj)
+    url = default_storage.url(saved_name)
+    if request and url.startswith('/'):
+        url = request.build_absolute_uri(url)
+    return Response({'url': url})
