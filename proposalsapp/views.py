@@ -4,7 +4,8 @@ import uuid
 from decimal import Decimal
 
 from django.core.files.storage import default_storage
-from django.db.models import Max, Q
+from django.db.models import Count, Max, Q
+from django.utils import timezone
 from django.core.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
 from pitchzo.validators import validate_image_file, validation_error_message
@@ -460,6 +461,60 @@ def portfolio_detail(request, slug, portfolio_id):
 
     portfolio.save()
     return Response(portfolio_to_dict(portfolio, request))
+
+
+# --- Overview Stats (authenticated, workspace-scoped) ---
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def workspace_overview(request, slug):
+    """Return overview stats for a workspace: proposal counts, portfolio count, etc."""
+    workspace = get_object_or_404(Workspace, slug=slug, owner=request.user)
+
+    total_proposals = Proposal.objects.filter(workspace=workspace).count()
+    sent_proposals = Proposal.objects.filter(
+        workspace=workspace, status=ProposalStatus.SENT
+    ).count()
+    drafts = Proposal.objects.filter(
+        workspace=workspace, status=ProposalStatus.DRAFT
+    ).count()
+    portfolio_assets = Portfolio.objects.filter(workspace=workspace).count()
+
+    today = timezone.now().date()
+    drafts_updated_today = Proposal.objects.filter(
+        workspace=workspace,
+        status=ProposalStatus.DRAFT,
+        updated_at__date=today,
+    ).count()
+
+    week_ago = today - timezone.timedelta(days=7)
+    proposals_this_week = Proposal.objects.filter(
+        workspace=workspace,
+        created_at__date__gte=week_ago,
+    ).count()
+
+    proposals_using_portfolio = Proposal.objects.filter(
+        workspace=workspace
+    ).annotate(projects_count=Count('projects')).filter(
+        projects_count__gt=0
+    ).count()
+
+    sent_percentage = (
+        round(sent_proposals / total_proposals * 100)
+        if total_proposals > 0
+        else 0
+    )
+
+    return Response({
+        'total_proposals': total_proposals,
+        'sent_proposals': sent_proposals,
+        'drafts': drafts,
+        'portfolio_assets': portfolio_assets,
+        'drafts_updated_today': drafts_updated_today,
+        'proposals_this_week': proposals_this_week,
+        'proposals_using_portfolio': proposals_using_portfolio,
+        'sent_percentage': sent_percentage,
+    })
 
 
 # --- Proposal CRUD (authenticated, workspace-scoped) ---

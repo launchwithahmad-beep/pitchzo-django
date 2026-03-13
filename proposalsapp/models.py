@@ -79,6 +79,7 @@ class ProposalSectionType(models.TextChoices):
     MEET_THE_TEAM = 'meet_the_team', 'Meet the Team'
     COMPANY_AGENCY_OVERVIEW = 'company_agency_overview', 'Company/Agency Overview'
     # Financials
+    SERVICES = 'services', 'Services'
     PRICING_ESTIMATE_TIERS = 'pricing_estimate_tiers', 'Pricing & Estimate Tiers'
     PAYMENT_SCHEDULE = 'payment_schedule', 'Payment Schedule'
     EXPECTED_ROI_BUSINESS_CASE = 'expected_roi_business_case', 'Expected ROI & Business Case'
