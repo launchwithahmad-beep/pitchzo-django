@@ -6,8 +6,12 @@ from decimal import Decimal
 from django.core.files.storage import default_storage
 from django.db.models import Count, Max, Q
 from django.utils import timezone
+from django.utils.safestring import mark_safe
 from django.core.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
+from django.template import Template as DjangoTemplate, Context
+from django.utils.html import escape
+import re
 from pitchzo.validators import validate_image_file, validation_error_message
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
@@ -31,7 +35,10 @@ from .models import (
     ProposalStatus,
     Template,
     TemplateCategory,
+    TemplateSection,
 )
+
+VALID_SECTION_TYPES = [c[0] for c in ProposalSectionType.choices]
 
 
 def portfolio_to_dict(portfolio, request=None):
@@ -68,20 +75,33 @@ def portfolio_to_dict(portfolio, request=None):
     }
 
 
+def template_section_to_dict(ts):
+    return {
+        'section_type': ts.section_type,
+        'title': ts.title,
+        'content': ts.content or '',
+        'order': ts.order,
+    }
+
+
 def template_to_dict(template, request=None):
     image_url = ''
     if template.image:
         image_url = template.image.url
         if request:
             image_url = request.build_absolute_uri(image_url)
+    sections = [
+        template_section_to_dict(ts)
+        for ts in template.template_sections.all().order_by('order', 'section_type')
+    ]
     return {
         'id': template.id,
         'title': template.title,
         'description': template.description or '',
         'image': image_url,
         'category': template.category,
-        'content': template.content,
         'active': template.active,
+        'sections': sections,
     }
 
 
@@ -180,7 +200,7 @@ def template_list_create(request):
 
     title = data.get('title')
     category = data.get('category')
-    content = data.get('content')
+    sections_data = data.get('sections')
 
     if not title:
         return Response(
@@ -198,11 +218,6 @@ def template_list_create(request):
             {'error': f'category must be one of: {", ".join(valid_categories)}'},
             status=status.HTTP_400_BAD_REQUEST
         )
-    if not content:
-        return Response(
-            {'error': 'content is required'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
     if not image_file:
         return Response(
             {'error': 'image is required'},
@@ -213,14 +228,56 @@ def template_list_create(request):
     except ValidationError as e:
         return Response({'error': validation_error_message(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+    if sections_data is not None:
+        if not isinstance(sections_data, list):
+            return Response(
+                {'error': 'sections must be a list of { section_type, title, content }'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        seen_types = set()
+        for i, item in enumerate(sections_data):
+            if not isinstance(item, dict):
+                return Response(
+                    {'error': f'sections[{i}] must be an object with section_type, title, content'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            st = item.get('section_type')
+            if not st:
+                return Response(
+                    {'error': f'sections[{i}] section_type is required'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if st not in VALID_SECTION_TYPES:
+                return Response(
+                    {'error': f'sections[{i}] section_type must be one of: {", ".join(VALID_SECTION_TYPES)}'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if st in seen_types:
+                return Response(
+                    {'error': f'sections: section_type "{st}" cannot be repeated'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            seen_types.add(st)
+
     template = Template.objects.create(
         title=title,
         description=data.get('description') or None,
         image=image_file,
         category=category,
-        content=content,
+        content=content or '',
         active=data.get('active', True) if isinstance(data.get('active'), bool) else True,
     )
+    if sections_data:
+        section_type_labels = dict(ProposalSectionType.choices)
+        for order, item in enumerate(sections_data):
+            st = item.get('section_type')
+            TemplateSection.objects.create(
+                template=template,
+                section_type=st,
+                title=item.get('title') or section_type_labels.get(st, st.replace('_', ' ').title()),
+                content=item.get('content') or '',
+                order=order,
+            )
     return Response(template_to_dict(template, request), status=status.HTTP_201_CREATED)
 
 
@@ -251,10 +308,50 @@ def template_detail(request, template_id):
         valid_categories = [c[0] for c in TemplateCategory.choices]
         if data['category'] in valid_categories:
             template.category = data['category']
-    if 'content' in data:
-        template.content = data['content']
     if 'active' in data:
         template.active = bool(data['active'])
+    if 'sections' in data:
+        sections_data = data['sections']
+        if not isinstance(sections_data, list):
+            return Response(
+                {'error': 'sections must be a list of { section_type, title, content }'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        seen_types = set()
+        for i, item in enumerate(sections_data):
+            if not isinstance(item, dict):
+                return Response(
+                    {'error': f'sections[{i}] must be an object with section_type, title, content'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            st = item.get('section_type')
+            if not st:
+                return Response(
+                    {'error': f'sections[{i}] section_type is required'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if st not in VALID_SECTION_TYPES:
+                return Response(
+                    {'error': f'sections[{i}] section_type must be one of: {", ".join(VALID_SECTION_TYPES)}'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if st in seen_types:
+                return Response(
+                    {'error': f'sections: section_type "{st}" cannot be repeated'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            seen_types.add(st)
+        template.template_sections.all().delete()
+        section_type_labels = dict(ProposalSectionType.choices)
+        for order, item in enumerate(sections_data):
+            st = item.get('section_type')
+            TemplateSection.objects.create(
+                template=template,
+                section_type=st,
+                title=item.get('title') or section_type_labels.get(st, st.replace('_', ' ').title()),
+                content=item.get('content') or '',
+                order=order,
+            )
     if image_file:
         try:
             validate_image_file(image_file)
@@ -760,10 +857,191 @@ def proposal_detail(request, slug, proposal_id):
     return Response(proposal_to_dict(proposal, request))
 
 
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def proposal_preview(request, slug, proposal_id):
+    """Render proposal preview: template sections filled with builder data. Returns rendered HTML per section."""
+    workspace = get_object_or_404(Workspace, slug=slug, owner=request.user)
+    proposal = get_object_or_404(Proposal, id=proposal_id, workspace=workspace)
+
+    if not proposal.template_id:
+        return Response(
+            {'error': 'Proposal has no template selected'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    template = proposal.template
+
+    # Build lookup: proposal section by section_type (for builder data)
+    proposal_sections_by_type = {
+        s.section_type: s
+        for s in proposal.sections.all().order_by('order', 'created_at')
+    }
+
+    # Build projects list for template context (image_url, title, description, detail)
+    projects = []
+    for p in proposal.projects.all():
+        image_url = ''
+        if p.image:
+            image_url = request.build_absolute_uri(p.image.url) if request else p.image.url
+        projects.append({
+            'image_url': image_url,
+            'title': p.title or '',
+            'description': p.description or '',
+            'detail': p.detail or '',
+        })
+
+    def _user_display_name(user):
+        parts = [user.first_name, user.last_name] if user else []
+        return ' '.join(p for p in parts if p) or (getattr(user, 'email', None) or 'User')
+
+    prepared_by = _user_display_name(proposal.sender) if proposal.sender else _user_display_name(request.user)
+
+    date_str = proposal.updated_at.strftime('%b %d, %Y') if proposal.updated_at else ''
+    client_name = proposal.client.name if proposal.client else ''
+
+    def _build_section_context(section, section_type, request):
+        """Build template context from section.content for section-specific variables."""
+        c = (section.content or {}) if section else {}
+        req = request
+
+        def _abs_url(url):
+            if url and req:
+                return req.build_absolute_uri(url)
+            return url or ''
+
+        out = {}
+        if section_type == 'services':
+            items = c.get('items') or []
+            out['services'] = [{
+                'title': i.get('title'),
+                'duration': i.get('duration'),
+                'price': i.get('price'),
+                'description': i.get('description'),
+            } for i in items]
+
+        elif section_type == 'pricing_estimate_tiers':
+            tiers = c.get('tiers') or []
+            out['tiers'] = [{
+                'title': t.get('title'),
+                'description': t.get('description'),
+                'price': t.get('price'),
+                'currency': t.get('currency'),
+            } for t in tiers]
+            out['currency'] = proposal.currency if proposal else ''
+
+        elif section_type == 'testimonials_reviews':
+            items = c.get('items') or []
+            out['testimonials'] = [{
+                'image_url': _abs_url(i.get('image')),
+                'quote': i.get('comment') or i.get('quote'),
+                'name': i.get('name') or i.get('reviewerName'),
+                'role': i.get('designation'),
+                'company': i.get('company'),
+            } for i in items]
+
+        elif section_type == 'meet_the_team':
+            members = c.get('members') or []
+            out['members'] = [{
+                'image_url': _abs_url(m.get('image')),
+                'name': m.get('name'),
+                'role': m.get('designation'),
+                'bio': m.get('description'),
+            } for m in members]
+
+        elif section_type == 'timeline_sprints':
+            items = c.get('items') or []
+            out['phases'] = [{
+                'title': i.get('title') or i.get('smallTitle'),
+                'duration': i.get('estimateTime'),
+            } for i in items]
+            out['milestones'] = c.get('milestones') or ''
+
+        elif section_type == 'faqs':
+            items = c.get('items') or []
+            out['faqs'] = [{'question': i.get('question'), 'answer': i.get('answer')} for i in items]
+
+        elif section_type == 'next_steps_cta':
+            out['headline'] = c.get('headline') or 'Next Steps'
+            out['next_steps'] = c.get('next_steps') or []
+            out['contact'] = c.get('contact') or ''
+            if c.get('ctaText'):
+                out['next_steps'] = [c['ctaText']] if not out['next_steps'] else out['next_steps']
+
+        elif section_type == 'acceptance_esignature':
+            out['acceptance_statement'] = c.get('acceptance_statement') or 'By signing below, you accept the terms of this proposal.'
+            out['signer_name'] = c.get('signer_name') or prepared_by
+            out['signer_title'] = c.get('signer_title')
+            out['signer_email'] = c.get('signer_email')
+            out['signature_date'] = date_str
+            sig_img = c.get('signatureImage') or c.get('signature_image_url')
+            out['signature_image_url'] = _abs_url(sig_img) if isinstance(sig_img, str) else ''
+            out['signature_text'] = c.get('signature_text')
+
+        elif section_type == 'payment_schedule':
+            out['milestones'] = c.get('milestones') or c.get('items') or []
+            out['payment_methods'] = c.get('payment_methods') or ''
+
+        return out
+
+    # Iterate over TEMPLATE sections (in template order) - show all that have content
+    sections_html = []
+    for ts in template.template_sections.all().order_by('order', 'section_type'):
+        content_stripped = (ts.content or '').strip()
+        if not content_stripped:
+            continue
+
+        # Get builder data from proposal section if it exists
+        section = proposal_sections_by_type.get(ts.section_type)
+        content_html = ((section.content or {}).get('html') or '') if section else ''
+        title = section.title if section else ts.title
+
+        ctx = {
+            'title': title,
+            'content': mark_safe(content_html),
+            'project_title': proposal.title,
+            'client_name': client_name,
+            'prepared_by': prepared_by,
+            'date': date_str,
+            'tagline': '',
+            'projects': projects,
+        }
+        ctx.update(_build_section_context(section, ts.section_type, request))
+
+        try:
+            t = DjangoTemplate(ts.content)
+            rendered = t.render(Context(ctx))
+            # If template rendered a full HTML document, extract style + body for embedding
+            parts = []
+            style_match = re.search(r'<style[^>]*>(.*?)</style>', rendered, re.DOTALL | re.IGNORECASE)
+            if style_match:
+                parts.append(f'<style>{style_match.group(1)}</style>')
+            body_match = re.search(r'<body[^>]*>(.*?)</body>', rendered, re.DOTALL | re.IGNORECASE)
+            if body_match:
+                body_html = body_match.group(1).strip()
+            else:
+                body_html = rendered
+
+            # For PDF preview: remove onclick handlers (openProjectModal etc.) - scripts don't run in embedded HTML
+            body_html = re.sub(r'\s+onclick="[^"]*"', '', body_html)
+            # Remove script blocks (they don't execute in React dangerouslySetInnerHTML)
+            body_html = re.sub(r'<script[^>]*>.*?</script>', '', body_html, flags=re.DOTALL | re.IGNORECASE)
+
+            parts.append(body_html)
+            sections_html.append({'html': ''.join(parts)})
+        except Exception:
+            continue
+
+    return Response({
+        'sections': sections_html,
+        'proposal_title': proposal.title,
+        'template_title': template.title if template else None,
+        'prepared_by': prepared_by,
+        'date': date_str,
+    })
+
+
 # --- Proposal Sections API ---
-
-VALID_SECTION_TYPES = [c[0] for c in ProposalSectionType.choices]
-
 
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])

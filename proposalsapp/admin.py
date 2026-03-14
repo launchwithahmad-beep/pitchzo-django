@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Portfolio, PortfolioImage, Proposal, Template
+from .models import Portfolio, PortfolioImage, Proposal, Template, TemplateSection
 
 
 class PortfolioImageInline(admin.TabularInline):
@@ -18,11 +18,18 @@ class PortfolioAdmin(admin.ModelAdmin):
     inlines = [PortfolioImageInline]
 
 
+class TemplateSectionInline(admin.TabularInline):
+    model = TemplateSection
+    extra = 0
+    ordering = ('order', 'section_type')
+
+
 @admin.register(Template)
 class TemplateAdmin(admin.ModelAdmin):
     list_display = ('title', 'category', 'active')
     list_filter = ('category', 'active')
     search_fields = ('title',)
+    inlines = [TemplateSectionInline]
 
 
 @admin.register(Proposal)

@@ -32,7 +32,6 @@ class Template(models.Model):
         max_length=50,
         choices=TemplateCategory.choices,
     )
-    content = models.TextField()
     active = models.BooleanField(default=True)
 
     def __str__(self):
@@ -89,6 +88,37 @@ class ProposalSectionType(models.TextChoices):
     FAQS = 'faqs', 'FAQs'
     TERMS_CONDITIONS_MSA = 'terms_conditions_msa', 'Terms, Conditions & MSA'
     ACCEPTANCE_ESIGNATURE = 'acceptance_esignature', 'Acceptance & E-Signature'
+
+
+class TemplateSection(models.Model):
+    """
+    One section per section_type per template. Section type cannot be repeated within a template.
+    content holds HTML for that section type.
+    """
+    template = models.ForeignKey(
+        Template,
+        on_delete=models.CASCADE,
+        related_name='template_sections',
+    )
+    section_type = models.CharField(
+        max_length=80,
+        choices=ProposalSectionType.choices,
+    )
+    title = models.CharField(max_length=255)
+    content = models.TextField(blank=True, default='')  # HTML content for this section type
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['order', 'section_type']
+        constraints = [
+            models.UniqueConstraint(
+                fields=('template', 'section_type'),
+                name='unique_template_section_type',
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.template.title} – {self.get_section_type_display()}"
 
 
 class ProposalCategory(models.TextChoices):
