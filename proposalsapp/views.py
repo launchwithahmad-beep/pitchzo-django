@@ -758,6 +758,16 @@ def proposal_list_create(request, slug):
     if project_ids:
         portfolios = Portfolio.objects.filter(id__in=project_ids, workspace=workspace)
         proposal.projects.set(portfolios)
+
+    # Add default cover page section (non-deletable)
+    ProposalSection.objects.create(
+        proposal=proposal,
+        section_type=ProposalSectionType.COVER_PAGE,
+        title=dict(ProposalSectionType.choices).get(ProposalSectionType.COVER_PAGE, 'Cover Page'),
+        content={},
+        order=0,
+    )
+
     return Response(proposal_to_dict(proposal, request), status=status.HTTP_201_CREATED)
 
 
@@ -1123,6 +1133,11 @@ def proposal_section_detail(request, slug, proposal_id, section_id):
         return Response(section_to_dict(section, request))
 
     if request.method == 'DELETE':
+        if section.section_type == ProposalSectionType.COVER_PAGE:
+            return Response(
+                {'error': 'The cover page cannot be deleted.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         section.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
