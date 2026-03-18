@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from django.core.files.storage import default_storage
 from django.db.models import Count, Max, Q
+from django.db import transaction
 from django.utils import timezone
 from django.utils.safestring import mark_safe
 from django.core.exceptions import ValidationError
@@ -771,6 +772,20 @@ def proposal_list_create(request, slug):
     return Response(proposal_to_dict(proposal, request), status=status.HTTP_201_CREATED)
 
 
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def client_proposals_list(request, slug, client_id):
+    """
+    List proposals for a specific client within a workspace.
+    """
+    workspace = get_object_or_404(
+        Workspace, slug=slug, owner=request.user
+    )
+    client = get_object_or_404(Client, id=client_id, workspace=workspace)
+    proposals = Proposal.objects.filter(workspace=workspace, client=client).order_by('-updated_at')
+    return Response([proposal_to_dict(p, request) for p in proposals])
+
+
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @permission_classes([IsAuthenticated])
 def proposal_detail(request, slug, proposal_id):
@@ -1119,6 +1134,102 @@ def proposal_section_reorder(request, slug, proposal_id):
 
     sections = proposal.sections.all().order_by('order', 'created_at')
     return Response([section_to_dict(s, request) for s in sections])
+
+
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+def proposal_builder_snapshot(request, slug, proposal_id):
+    """
+    Persist the builder snapshot (sections list) in one request.
+
+    This is used by Undo/Redo so the restored UI state is saved to DB too.
+    Cover page is protected: it cannot be deleted.
+    """
+    workspace = get_object_or_404(Workspace, slug=slug, owner=request.user)
+    proposal = get_object_or_404(Proposal, id=proposal_id, workspace=workspace)
+
+    data = request.data
+    sections_data = data.get('sections')
+    if not isinstance(sections_data, list):
+        return Response({'error': 'sections must be an array'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Ensure cover page always exists
+    cover = proposal.sections.filter(section_type=ProposalSectionType.COVER_PAGE).first()
+    if not cover:
+        cover = ProposalSection.objects.create(
+            proposal=proposal,
+            section_type=ProposalSectionType.COVER_PAGE,
+            title=dict(ProposalSectionType.choices).get(ProposalSectionType.COVER_PAGE, 'Cover Page'),
+            content={},
+            order=0,
+        )
+
+    # Normalize incoming sections; we will upsert all non-cover sections
+    normalized = []
+    for idx, item in enumerate(sections_data):
+        if not isinstance(item, dict):
+            return Response({'error': f'sections[{idx}] must be an object'}, status=status.HTTP_400_BAD_REQUEST)
+        section_type = item.get('section_type')
+        if not section_type or section_type not in VALID_SECTION_TYPES:
+            return Response(
+                {'error': f'sections[{idx}].section_type must be one of: {", ".join(VALID_SECTION_TYPES)}'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Never allow snapshot to delete/replace cover; we manage it separately
+        if section_type == ProposalSectionType.COVER_PAGE:
+            continue
+        normalized.append({
+            'id': item.get('id'),
+            'section_type': section_type,
+            'title': (item.get('title') or '').strip() or dict(ProposalSectionType.choices).get(
+                section_type, section_type.replace('_', ' ').title()
+            ),
+            'content': item.get('content') if isinstance(item.get('content'), dict) else {},
+            'order': item.get('order'),
+        })
+
+    existing_by_id = {str(s.id): s for s in proposal.sections.all()}
+    keep_ids = set()
+
+    with transaction.atomic():
+        # Upsert incoming sections
+        for i, item in enumerate(normalized):
+            raw_id = item.get('id')
+            section = existing_by_id.get(str(raw_id)) if raw_id else None
+            if section and section.section_type != ProposalSectionType.COVER_PAGE:
+                section.title = item['title']
+                section.content = item['content']
+                try:
+                    section.order = int(item['order']) if item['order'] is not None else (i + 1)
+                except (ValueError, TypeError):
+                    section.order = i + 1
+                section.save()
+                keep_ids.add(str(section.id))
+            else:
+                # Create new section (new UUID). This supports undoing deletes.
+                try:
+                    order_val = int(item['order']) if item['order'] is not None else (i + 1)
+                except (ValueError, TypeError):
+                    order_val = i + 1
+                created = ProposalSection.objects.create(
+                    proposal=proposal,
+                    section_type=item['section_type'],
+                    title=item['title'],
+                    content=item['content'],
+                    order=order_val,
+                )
+                keep_ids.add(str(created.id))
+
+        # Delete sections not in snapshot (except cover page)
+        proposal.sections.exclude(section_type=ProposalSectionType.COVER_PAGE).exclude(
+            id__in=[uuid.UUID(x) for x in keep_ids if isinstance(x, str)]
+        ).delete()
+
+        # Keep cover page at order 0
+        cover.order = 0
+        cover.save()
+
+    return Response(proposal_to_dict(proposal, request))
 
 
 @api_view(['GET', 'PATCH', 'DELETE'])
