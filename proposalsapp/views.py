@@ -1,8 +1,10 @@
 import json
 import os
+import shutil
 import uuid
 from decimal import Decimal
 
+from django.conf import settings
 from django.core.files.storage import default_storage
 from django.db.models import Count, Max, Q
 from django.db import transaction
@@ -13,6 +15,7 @@ from django.shortcuts import get_object_or_404
 from django.template import Template as DjangoTemplate, Context
 from django.utils.html import escape
 import re
+from django.http import HttpResponse
 from pitchzo.validators import validate_image_file, validation_error_message
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
@@ -1009,6 +1012,16 @@ def proposal_preview(request, slug, proposal_id):
 
         return out
 
+    # Load the template's external stylesheet once and inline it into every section.
+    # html2canvas cannot fetch external files, so the CSS must be embedded as <style>.
+    template_css = ''
+    try:
+        styling = template.template_styling  # reverse OneToOne from TemplatesStylings
+        if styling and styling.stylesheet:
+            template_css = styling.stylesheet.read().decode('utf-8')
+    except Exception:
+        template_css = ''
+
     # Iterate over TEMPLATE sections (in template order) - show all that have content
     sections_html = []
     for ts in template.template_sections.all().order_by('order', 'section_type'):
@@ -1024,6 +1037,8 @@ def proposal_preview(request, slug, proposal_id):
         ctx = {
             'title': title,
             'content': mark_safe(content_html),
+            'proposal_title': proposal.title or '',
+            'proposal_description': proposal.description or '',
             'project_title': proposal.title,
             'client_name': client_name,
             'prepared_by': prepared_by,
@@ -1036,20 +1051,63 @@ def proposal_preview(request, slug, proposal_id):
         try:
             t = DjangoTemplate(ts.content)
             rendered = t.render(Context(ctx))
-            # If template rendered a full HTML document, extract style + body for embedding
             parts = []
+
+            # 1. Always inline the shared template stylesheet first (replaces <link href="styles.css">)
+            if template_css:
+                parts.append(f'<style>{template_css}</style>')
+
+            # 2. Capture any per-section inline <style> block
             style_match = re.search(r'<style[^>]*>(.*?)</style>', rendered, re.DOTALL | re.IGNORECASE)
             if style_match:
                 parts.append(f'<style>{style_match.group(1)}</style>')
+
+            # 3. Extract body content
             body_match = re.search(r'<body[^>]*>(.*?)</body>', rendered, re.DOTALL | re.IGNORECASE)
             if body_match:
                 body_html = body_match.group(1).strip()
             else:
                 body_html = rendered
 
-            # For PDF preview: remove onclick handlers (openProjectModal etc.) - scripts don't run in embedded HTML
+            # For PDF preview: remove onclick handlers, then convert JS innerHTML injections to static HTML
             body_html = re.sub(r'\s+onclick="[^"]*"', '', body_html)
-            # Remove script blocks (they don't execute in React dangerouslySetInnerHTML)
+
+            # Convert patterns like:
+            #   document.getElementById('id').innerHTML = `<html>`;
+            #   document.getElementById("id").innerHTML = `<html>`;
+            # into static HTML injection so description/content shows in the PDF.
+            def _apply_innerhtml_injections(html, script_blocks):
+                for script_content in script_blocks:
+                    # Match: (document.getElementById('id') OR getElementById("id")).innerHTML = `...`
+                    for m in re.finditer(
+                        r'(?:document\.)?getElementById\(["\']([^"\']+)["\']\)'
+                        r'(?:\.innerHTML\s*=\s*`(.*?)`|\.innerHTML\s*=\s*"((?:[^"\\]|\\.)*)")',
+                        script_content,
+                        re.DOTALL,
+                    ):
+                        target_id = m.group(1)
+                        injected = m.group(2) if m.group(2) is not None else m.group(3)
+                        if injected is None:
+                            continue
+                        # Unescape backtick template literals (no JS needed)
+                        injected = injected.strip()
+                        # Replace the empty element with id="target_id" with content injected
+                        html = re.sub(
+                            rf'(<[^>]+\bid="{re.escape(target_id)}"[^>]*>)(</[^>]+>)',
+                            rf'\1{injected}\2',
+                            html,
+                            count=1,
+                            flags=re.IGNORECASE,
+                        )
+                return html
+
+            # Collect all script block contents before stripping
+            script_contents = re.findall(
+                r'<script[^>]*>(.*?)</script>', body_html, flags=re.DOTALL | re.IGNORECASE
+            )
+            body_html = _apply_innerhtml_injections(body_html, script_contents)
+
+            # Now strip script blocks
             body_html = re.sub(r'<script[^>]*>.*?</script>', '', body_html, flags=re.DOTALL | re.IGNORECASE)
 
             parts.append(body_html)
@@ -1064,6 +1122,331 @@ def proposal_preview(request, slug, proposal_id):
         'prepared_by': prepared_by,
         'date': date_str,
     })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def proposal_preview_pdf(request, slug, proposal_id):
+    """
+    Generate a PDF preview in the backend using Playwright.
+
+    This endpoint renders the template sections (in the same order as the proposal
+    sidebar / section ordering by `order`) into one combined HTML document,
+    then uses Playwright's headless Chromium to print it as a Letter PDF.
+    """
+    workspace = get_object_or_404(Workspace, slug=slug, owner=request.user)
+    proposal = get_object_or_404(Proposal, id=proposal_id, workspace=workspace)
+
+    if not proposal.template_id:
+        return Response(
+            {'error': 'Proposal has no template selected'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    template = proposal.template
+
+    # Build lookup: proposal sections by section_type
+    proposal_sections_ordered = proposal.sections.all().order_by('order', 'created_at')
+
+    template_sections_by_type = {
+        ts.section_type: ts
+        for ts in template.template_sections.all().order_by('order', 'section_type')
+    }
+    template_renderers_by_type = {
+        ts.section_type: DjangoTemplate(ts.content)
+        for ts in template.template_sections.all().order_by('order', 'section_type')
+    }
+
+    # Build projects list for template context (image_url, title, description, detail)
+    projects = []
+    for p in proposal.projects.all():
+        image_url = ''
+        if p.image:
+            image_url = request.build_absolute_uri(p.image.url) if request else p.image.url
+        projects.append({
+            'image_url': image_url,
+            'title': p.title or '',
+            'description': p.description or '',
+            'detail': p.detail or '',
+        })
+
+    def _user_display_name(user):
+        parts = [user.first_name, user.last_name] if user else []
+        return ' '.join(p for p in parts if p) or (getattr(user, 'email', None) or 'User')
+
+    prepared_by = _user_display_name(proposal.sender) if proposal.sender else _user_display_name(request.user)
+    date_str = proposal.updated_at.strftime('%b %d, %Y') if proposal.updated_at else ''
+    client_name = proposal.client.name if proposal.client else ''
+
+    def _build_section_context(section, section_type, request):
+        c = (section.content or {}) if section else {}
+        req = request
+
+        def _abs_url(url):
+            if url and req:
+                return req.build_absolute_uri(url)
+            return url or ''
+
+        out = {}
+        if section_type == 'services':
+            items = c.get('items') or []
+            out['services'] = [{
+                'title': i.get('title'),
+                'duration': i.get('duration'),
+                'price': i.get('price'),
+                'description': i.get('description'),
+            } for i in items]
+
+        elif section_type == 'pricing_estimate_tiers':
+            tiers = c.get('tiers') or []
+            out['tiers'] = [{
+                'title': t.get('title'),
+                'description': t.get('description'),
+                'price': t.get('price'),
+                'currency': t.get('currency'),
+            } for t in tiers]
+            out['currency'] = proposal.currency if proposal else ''
+
+        elif section_type == 'testimonials_reviews':
+            items = c.get('items') or []
+            out['testimonials'] = [{
+                'image_url': _abs_url(i.get('image')),
+                'quote': i.get('comment') or i.get('quote'),
+                'name': i.get('name') or i.get('reviewerName'),
+                'role': i.get('designation'),
+                'company': i.get('company'),
+            } for i in items]
+
+        elif section_type == 'meet_the_team':
+            members = c.get('members') or []
+            out['members'] = [{
+                'image_url': _abs_url(m.get('image')),
+                'name': m.get('name'),
+                'role': m.get('designation'),
+                'bio': m.get('description'),
+            } for m in members]
+
+        elif section_type == 'timeline_sprints':
+            items = c.get('items') or []
+            out['phases'] = [{
+                'title': i.get('title') or i.get('smallTitle'),
+                'duration': i.get('estimateTime'),
+            } for i in items]
+            out['milestones'] = c.get('milestones') or ''
+
+        elif section_type == 'faqs':
+            items = c.get('items') or []
+            out['faqs'] = [{'question': i.get('question'), 'answer': i.get('answer')} for i in items]
+
+        elif section_type == 'next_steps_cta':
+            out['headline'] = c.get('headline') or 'Next Steps'
+            out['next_steps'] = c.get('next_steps') or []
+            out['contact'] = c.get('contact') or ''
+            if c.get('ctaText'):
+                out['next_steps'] = [c['ctaText']] if not out['next_steps'] else out['next_steps']
+
+        elif section_type == 'acceptance_esignature':
+            out['acceptance_statement'] = c.get('acceptance_statement') or 'By signing below, you accept the terms of this proposal.'
+            out['signer_name'] = c.get('signer_name') or prepared_by
+            out['signer_title'] = c.get('signer_title')
+            out['signer_email'] = c.get('signer_email')
+            out['signature_date'] = date_str
+            sig_img = c.get('signatureImage') or c.get('signature_image_url')
+            out['signature_image_url'] = _abs_url(sig_img) if isinstance(sig_img, str) else ''
+            out['signature_text'] = c.get('signature_text')
+
+        elif section_type == 'payment_schedule':
+            out['milestones'] = c.get('milestones') or c.get('items') or []
+            out['payment_methods'] = c.get('payment_methods') or ''
+
+        return out
+
+    # Load template stylesheet and inline it globally (for Playwright print)
+    template_css = ''
+    try:
+        styling = template.template_styling  # reverse OneToOne from TemplatesStylings
+        if styling and styling.stylesheet:
+            template_css = styling.stylesheet.read().decode('utf-8')
+    except Exception:
+        template_css = ''
+
+    sections_wrapped = []
+    rendered_count = 0
+
+    for section in proposal_sections_ordered:
+        ts = template_sections_by_type.get(section.section_type)
+        if not ts:
+            continue
+        content_stripped = (ts.content or '').strip()
+        if not content_stripped:
+            continue
+
+        content_html = ((section.content or {}).get('html') or '') if section else ''
+        title = section.title if section else ts.title
+
+        # Split title for coloring the last word
+        full_title = proposal.title or ''
+        words = full_title.strip().split()
+        title_prefix = ' '.join(words[:-1]) if len(words) > 1 else ''
+        title_last = words[-1] if words else ''
+
+        ctx = {
+            'title': title,
+            'content': mark_safe(content_html),
+            'proposal_title': proposal.title or '',
+            'title_prefix': title_prefix,
+            'title_last': title_last,
+            'proposal_description': mark_safe(proposal.description or ''),
+            'project_title': proposal.title,
+            'client_name': client_name,
+            'prepared_by': prepared_by,
+            'date': date_str,
+            'tagline': '',
+            'projects': projects,
+            'workspace_name': workspace.name,
+        }
+        ctx.update(_build_section_context(section, ts.section_type, request))
+
+        # Render the template section HTML with Django
+        t = template_renderers_by_type.get(section.section_type)
+        if not t:
+            continue
+        rendered = t.render(Context(ctx))
+
+        # Extract the body HTML from the rendered HTML.
+        body_match = re.search(r'<body[^>]*>(.*?)</body>', rendered, re.DOTALL | re.IGNORECASE)
+        if body_match:
+            body_html = body_match.group(1).strip()
+        else:
+            body_html = rendered
+
+        # Wrap each section so Playwright can paginate reliably.
+        # Use inline style so it works even if templates include their own CSS.
+        rendered_count += 1
+        sections_wrapped.append(
+            f"<div class='pdf-page' style='break-after: page; page-break-after: always;'>{body_html}</div>"
+        )
+
+    if rendered_count == 0:
+        return Response(
+            {'error': 'No sections rendered for this template'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # Avoid a trailing forced page break on the last section.
+    sections_wrapped[-1] = re.sub(
+        r"break-after:\s*page; page-break-after:\s*always;",
+        "break-after:auto;",
+        sections_wrapped[-1],
+        flags=re.IGNORECASE
+    )
+
+    is_image_mode = request.GET.get('preview_mode') == 'images'
+    
+    # Common styles for both high-fidelity images and final PDF
+    width_css = "width:816px; margin:0 auto; background:white; min-height:1056px;"
+    if not is_image_mode:
+        width_css += " page-break-after:always; overflow:visible;"
+
+    extra_css = """
+    .deco-bg { 
+        mask-image: linear-gradient(to bottom, black 0%, black 85%, transparent 100%) !important;
+        -webkit-mask-image: linear-gradient(to bottom, black 0%, black 85%, transparent 100%) !important;
+    }
+    .book-page::before { display: none !important; } /* Remove paper texture lines */
+    .book-page { 
+        display: flex !important;
+        flex-direction: column !important;
+        justify-content: center !important;
+        min-height: 1056px !important; 
+        height: auto !important;
+        overflow: visible !important;
+        padding-top: 100px !important;
+        padding-bottom: 100px !important;
+        box-sizing: border-box !important;
+    }
+    .running-header {
+        position: absolute !important;
+        top: 40px !important;
+        left: 60px !important;
+        right: 60px !important;
+        margin: 0 !important;
+    }
+    """
+
+    combined_html = (
+        "<!doctype html><html><head><meta charset='utf-8'/>"
+        "<style>"
+        "html,body{margin:0;padding:0;} "
+        "@page{size:letter;margin:0;} "
+        f".pdf-page{{{width_css}}} "
+        f"{extra_css}"
+        f"{template_css if template_css else ''}"
+        "</style>"
+        "</head><body>"
+        + "".join(sections_wrapped) +
+        "</body></html>"
+    )
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return Response(
+            {'error': 'Playwright is not installed on the server'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+    # Render to PDF or Images with headless Chromium
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox']
+        )
+        # Set viewport before setting content so 100vh/centering works correctly
+        page = browser.new_page(viewport={"width": 816, "height": 1056})
+        base_url = request.build_absolute_uri('/') if request else None
+        # Templates are designed for screen; force screen media for PDF export too
+        page.emulate_media(media="screen")
+        page.set_content(combined_html, wait_until="networkidle", timeout=60000)
+        # Extra safety for any transitions or late-loading assets
+        page.wait_for_timeout(2000)
+
+        if is_image_mode:
+            preview_dir = os.path.join(settings.MEDIA_ROOT, 'proposal_previews', str(proposal.id))
+            if os.path.exists(preview_dir):
+                shutil.rmtree(preview_dir)
+            os.makedirs(preview_dir, exist_ok=True)
+
+            images_urls = []
+            page.set_viewport_size({"width": 816, "height": 1056})
+            locators = page.locator(".pdf-page")
+            count = locators.count()
+            timestamp = int(timezone.now().timestamp())
+            
+            for i in range(count):
+                file_name = f"page_{i+1}.jpg"
+                file_path = os.path.join(preview_dir, file_name)
+                locators.nth(i).screenshot(path=file_path, type="jpeg", quality=90)
+                
+                # Build public URL
+                relative_path = f"proposal_previews/{proposal.id}/{file_name}"
+                image_url = request.build_absolute_uri(settings.MEDIA_URL + relative_path)
+                images_urls.append(f"{image_url}?v={timestamp}")
+
+            browser.close()
+            return Response({'images': images_urls})
+
+        pdf_bytes = page.pdf(
+            format='letter',
+            print_background=True,
+            margin={'top': '0', 'bottom': '0', 'left': '0', 'right': '0'},
+        )
+        browser.close()
+
+    filename = f"{proposal.title}.pdf"
+    response = HttpResponse(pdf_bytes, content_type="application/pdf")
+    response["Content-Disposition"] = f'inline; filename="{filename}"'
+    return response
 
 
 # --- Proposal Sections API ---

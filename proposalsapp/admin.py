@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Portfolio, PortfolioImage, Proposal, Template, TemplateSection
+from .models import Portfolio, PortfolioImage, Proposal, Template, TemplateSection, TemplatesStylings
 
 
 class PortfolioImageInline(admin.TabularInline):
@@ -40,3 +40,10 @@ class ProposalAdmin(admin.ModelAdmin):
     raw_id_fields = ('client', 'sender', 'workspace')
     readonly_fields = ('id', 'created_at', 'updated_at')
     filter_horizontal = ('projects',)
+
+
+@admin.register(TemplatesStylings)
+class TemplatesStylingsAdmin(admin.ModelAdmin):
+    list_display = ('template', 'stylesheet')
+    search_fields = ('template__title',)
+    raw_id_fields = ('template',)

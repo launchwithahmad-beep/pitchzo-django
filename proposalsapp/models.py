@@ -1,6 +1,7 @@
 import uuid
 from django.db import models
 from django.conf import settings
+from django.core.validators import FileExtensionValidator
 
 from .validators import validate_portfolio_image
 
@@ -84,7 +85,6 @@ class ProposalSectionType(models.TextChoices):
     EXPECTED_ROI_BUSINESS_CASE = 'expected_roi_business_case', 'Expected ROI & Business Case'
     ONGOING_MAINTENANCE_SUPPORT = 'ongoing_maintenance_support', 'Ongoing Maintenance & Support'
     # Closing & Legal
-    NEXT_STEPS_CTA = 'next_steps_cta', 'Next Steps & CTA'
     FAQS = 'faqs', 'FAQs'
     TERMS_CONDITIONS_MSA = 'terms_conditions_msa', 'Terms, Conditions & MSA'
     ACCEPTANCE_ESIGNATURE = 'acceptance_esignature', 'Acceptance & E-Signature'
@@ -119,6 +119,25 @@ class TemplateSection(models.Model):
 
     def __str__(self):
         return f"{self.template.title} – {self.get_section_type_display()}"
+
+
+class TemplatesStylings(models.Model):
+    template = models.OneToOneField(
+        Template,
+        on_delete=models.CASCADE,
+        related_name='template_styling',
+    )
+    stylesheet = models.FileField(
+        upload_to='template_stylesheets/',
+        validators=[FileExtensionValidator(allowed_extensions=['css'])],
+    )
+
+    class Meta:
+        verbose_name = 'Template Styling'
+        verbose_name_plural = 'Template Stylings'
+
+    def __str__(self):
+        return f"{self.template.title} stylesheet"
 
 
 class ProposalCategory(models.TextChoices):
